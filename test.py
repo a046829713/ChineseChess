@@ -1,5 +1,4 @@
-import numpy as np
+import torch
 
 
-for i in enumerate([1,2,3]):
-    print(i)
+print(0.99**200)

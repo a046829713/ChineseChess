@@ -10,10 +10,11 @@ class GameConfig:
         self.TOTAL_ACTIONS = 1024 
 
         # --- PPO 超參數 (Hyperparameters) ---
-        self.LEARNING_RATE = 0.0005
-        self.GAMMA = 0.99       # 折扣因子
+        self.LEARNING_RATE = 0.0003
+        self.GAMMA = 0.95       # 折扣因子 (降低以加速終局信號傳遞)
         self.EPS_CLIP = 0.2     # PPO Clip 範圍
-        self.K_EPOCHS = 4       # 每次更新的訓練次數
+        self.K_EPOCHS = 10      # 最多迭代次數 (配合 KL 早停)
+        self.KL_TARGET = 0.015  # KL divergence 目標值 (超過就停止迭代)
         
         # --- 神經網路架構 ---
         self.EMBED_DIM = 32     # 棋子 Embedding 維度
@@ -21,12 +22,12 @@ class GameConfig:
         self.HIDDEN_DIM_2 = 128 # 第二層隱藏層
 
         # --- 獎勵機制 (Rewards) ---
-        self.REWARD_FLIP = 0.002     # 翻牌獎勵 (鼓勵開局)
+        self.REWARD_FLIP = 0.05      # 翻牌獎勵 (提高以鼓勵探索新棋子)
         self.REWARD_MOVE = -0.01     # 普通移動
         self.REWARD_EAT = 1.0        # 吃子獎勵 (提高以鼓勵進攻)
         self.REWARD_WIN = 10.0      # 獲勝獎勵
         self.REWARD_LOSE = -10.0    # 落敗懲罰
-        self.REWARD_DRAW = -5.0      # 和棋 (提高懲罰，避免 AI 故意拖延)
+        self.REWARD_DRAW = -8.0      # 和棋 (接近落敗，逼迫 AI 積極進攻)\r\n        self.REWARD_EATEN = -0.5     # 被吃子懲罰 (讓 AI 學會保護/逃跑)
         
         
     
@@ -37,7 +38,7 @@ class GameConfig:
         # --- 訓練設定 ---
         self.MAX_EPISODES = 10000    # 總訓練局數
 
-        self.UPDATE_FREQ = 1       # 每幾局更新一次網路
+        self.UPDATE_FREQ = 5       # 每幾局更新一次網路
         self.PRINT_FREQ = 50        # 每幾局印出一次 Log
 
         # 棋子編碼

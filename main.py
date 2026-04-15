@@ -7,6 +7,7 @@ from config import GameConfig
 from env import DarkChessEnv
 from model import PPOAgent
 from model import Memory
+from diagnostic import TrainingDiagnostics
 import torch
 import os
 
@@ -22,9 +23,12 @@ class DarkChessGUI:
         self.env = DarkChessEnv(self.cfg)        
         self.agent = PPOAgent(self.cfg) 
 
-        self.memory_red = Memory()   # 專存紅方 (Turn 0) 的 (s, a, r)
-        self.memory_black = Memory() # 專存黑方 (Turn 1) 的 (s, a, r)
+        self.memory_red = Memory()   # 專存紅方的 (s, a, r)
+        self.memory_black = Memory() # 專存黑方的 (s, a, r)
         
+        # [新增] 訓練診斷工具
+        self.diagnostics = TrainingDiagnostics(save_dir=self.cfg.SAVE_PATH)
+
         self.frame_container = tk.Frame(root)
         self.frame_container.pack()
 
@@ -210,7 +214,7 @@ class DarkChessGUI:
         self.env.reset()
         self.human_playing = True
         self.selected_pos = None
-        self.agent.load_model("C:\workspace\ChineseChess\ChineseChess\Save\model_12.0.pt")
+        self.agent.load_model("C:\\workspace\\ChineseChess\\ChineseChess\\Save\\model_22.0.pt")
         self.draw_board()
         self.lbl_status.config(text="遊戲開始！請點選棋子")
         self.canvas.bind("<Button-1>", self.canvas_click)
@@ -226,6 +230,50 @@ class DarkChessGUI:
         thread = threading.Thread(target=self.train_loop, daemon=True)
         thread.start()
 
+    # =========================================================================
+    # [新增] 輔助方法：將 turn 索引 (0/1) 轉換為顏色 (COLOR_RED/COLOR_BLACK)
+    # =========================================================================
+    def _get_player_color(self, turn_index):
+        """
+        根據 turn 索引取得該玩家的實際顏色。
+        
+        turn_index=0 的玩家的顏色 = self.env.my_color
+        turn_index=1 的玩家的顏色 = 1 - self.env.my_color
+        
+        注意：必須在第一次翻牌後 (my_color 已確定) 才能呼叫。
+        """
+        if self.env.my_color == self.cfg.COLOR_UNKNOWN:
+            # 尚未決定顏色 (不應該發生在需要判斷顏色的時候)
+            # 安全起見給一個預設值
+            return self.cfg.COLOR_RED if turn_index == 0 else self.cfg.COLOR_BLACK
+        
+        if turn_index == 0:
+            return self.env.my_color
+        else:
+            return 1 - self.env.my_color
+
+    # =========================================================================
+    # [新增] 輔助方法：為指定顏色的記憶體添加獎勵
+    # =========================================================================
+    def _add_reward_to_memory(self, color, reward_value, terminal=False):
+        """
+        將額外獎勵加到指定顏色玩家的最後一步記憶中。
+        用於遊戲結束時為非當前行動者分配勝負/和局獎勵。
+        """
+        if color == self.cfg.COLOR_RED:
+            if len(self.memory_red.rewards) > 0:
+                self.memory_red.rewards[-1] += reward_value
+                if terminal:
+                    self.memory_red.is_terminals[-1] = True
+        else:
+            if len(self.memory_black.rewards) > 0:
+                self.memory_black.rewards[-1] += reward_value
+                if terminal:
+                    self.memory_black.is_terminals[-1] = True
+
+    # =========================================================================
+    # 主訓練迴圈 (修正版)
+    # =========================================================================
     def train_loop(self):
         for i_episode in range(1, self.cfg.MAX_EPISODES + 1):
             
@@ -233,107 +281,147 @@ class DarkChessGUI:
                 break
 
             state, _, eaten_state = self.env.reset()
-            episodic_reward = 0
-            episodic_red_reward = 0
-            episodic_black_reward = 0
-
-            last_mask_red = None
-            last_mask_black = None
+            step_count = 0
+            # [修正] 追蹤單局獎勵 (不再使用 memory 累計值)
+            ep_rewards = {'red': 0.0, 'black': 0.0}
 
             while True:
                 current_turn = self.env.turn
                 mask = self.env.get_legal_actions(current_turn)
 
-                if not any(mask): # 如果沒有任何 True
-                    # 當前玩家被困住 -> 輸了 (LOSE)
-                    # 對手 -> 贏了 (WIN)
-                    winner = 1 - current_turn                    
-                    self.assign_loser_punishment(winner)
-
+                # --- 無合法動作：當前玩家被困住 → 輸了 ---
+                if not any(mask):
+                    winner_turn = 1 - current_turn
+                    winner_color = self._get_player_color(winner_turn)
+                    loser_color = self._get_player_color(current_turn)
                     
-                    # 結束這局
+                    # 懲罰輸家 (修改其最後一步的獎勵)
+                    self._add_reward_to_memory(loser_color, self.cfg.REWARD_LOSE, terminal=True)
+                    # 獎勵贏家 (因為沒有經過 env.step，贏家不會從 step 拿到獎勵)
+                    self._add_reward_to_memory(winner_color, self.cfg.REWARD_WIN, terminal=True)
+                    
+                    # 追蹤單局獎勵
+                    loser_key = 'red' if loser_color == self.cfg.COLOR_RED else 'black'
+                    winner_key = 'red' if winner_color == self.cfg.COLOR_RED else 'black'
+                    ep_rewards[loser_key] += self.cfg.REWARD_LOSE
+                    ep_rewards[winner_key] += self.cfg.REWARD_WIN
+                    
+                    self.env.game_over = True
+                    self.env.winner = winner_color
                     break
 
-                # [修正] 訓練時傳入 Turn
+                # 選擇動作
                 action, log_prob = self.agent.select_action(state, current_turn, mask, eaten_state)
                 
+                # 執行動作
                 next_state_info, reward, done, _ = self.env.step(action)
                 next_state, next_turn, next_eaten_state = next_state_info
-                
+                step_count += 1
 
+                # =============================================================
+                # [修正 Bug 7] 按顏色儲存到正確的記憶體
+                # 原本用 current_turn (0/1) 直接對應 memory_red/black，
+                # 但 turn=0 不一定是紅方！必須透過 my_color 映射。
+                # =============================================================
+                current_color = self._get_player_color(current_turn)
+                color_key = 'red' if current_color == self.cfg.COLOR_RED else 'black'
+                ep_rewards[color_key] += reward  # 追蹤單局獎勵
                 
-                # 4. [雙記憶體儲存邏輯]
-                # 我們將資料存入「當前行動者」的記憶體中
-                # 注意：這時候的 reward 通常只是「吃子獎勵」，「勝負獎勵」可能還沒出來
-                
-                if current_turn == 0: # 紅方
+                if current_color == self.cfg.COLOR_RED:
                     self.memory_red.states.append(torch.FloatTensor(state))
                     self.memory_red.eaten_states.append(torch.FloatTensor(eaten_state))
                     self.memory_red.turns.append(current_turn)
                     self.memory_red.masks.append(torch.BoolTensor(mask))
                     self.memory_red.actions.append(torch.tensor(action))
                     self.memory_red.logprobs.append(torch.tensor(log_prob))
-                    self.memory_red.rewards.append(reward) # 暫存當下獎勵
+                    self.memory_red.rewards.append(reward)
                     self.memory_red.is_terminals.append(done)
-                    episodic_red_reward += reward
-                else: # 黑方
+                else:
                     self.memory_black.states.append(torch.FloatTensor(state))
                     self.memory_black.eaten_states.append(torch.FloatTensor(eaten_state))
                     self.memory_black.turns.append(current_turn)
                     self.memory_black.masks.append(torch.BoolTensor(mask))
                     self.memory_black.actions.append(torch.tensor(action))
                     self.memory_black.logprobs.append(torch.tensor(log_prob))
-                    self.memory_black.rewards.append(reward) # 暫存當下獎勵
+                    self.memory_black.rewards.append(reward)
                     self.memory_black.is_terminals.append(done)
-                    episodic_black_reward +=reward
 
-                episodic_reward += reward
                 state = next_state
                 eaten_state = next_eaten_state
 
-                # 5. [處理正常結束] (例如清空棋子或步數上限)
+                # --- 遊戲正常結束 (吃光棋子、步數上限、重複局面) ---
                 if done:
-                    print("self.env.winner:", self.env.winner,"最後獎勵為:",reward)
                     if self.env.winner is not None:
-                        self.assign_loser_punishment(self.env.winner)
+                        # =================================================
+                        # [修正] 正確分配勝負獎勵
+                        # env.step() 已經給當前行動者獎勵 (WIN 或 LOSE)
+                        # 這裡只需要處理「對手」(非當前行動者) 的獎勵
+                        # =================================================
+                        winner_color = self.env.winner
+                        current_color = self._get_player_color(current_turn)
+                        opponent_color = self._get_player_color(1 - current_turn)
+                        
+                        opponent_key = 'red' if opponent_color == self.cfg.COLOR_RED else 'black'
+                        if current_color == winner_color:
+                            # 當前行動者贏了 (已從 step 拿到 REWARD_WIN)
+                            # → 對手輸了，需要加 LOSE 到對手的最後一步
+                            self._add_reward_to_memory(opponent_color, self.cfg.REWARD_LOSE, terminal=True)
+                            ep_rewards[opponent_key] += self.cfg.REWARD_LOSE
+                        else:
+                            # 當前行動者輸了 (已從 step 拿到 REWARD_LOSE)
+                            # → 對手贏了，需要加 WIN 到對手的最後一步
+                            self._add_reward_to_memory(opponent_color, self.cfg.REWARD_WIN, terminal=True)
+                            ep_rewards[opponent_key] += self.cfg.REWARD_WIN
                     else:
-                        self.assign_draw_punishment(current_turn)
-
-                    if self.env.winner == self.cfg.COLOR_RED:
-                        episodic_black_reward += self.cfg.REWARD_LOSE
-
-                    elif self.env.winner == self.cfg.COLOR_BLACK:
-                        episodic_red_reward += self.cfg.REWARD_LOSE
+                        # 和局：當前行動者已從 step 拿到 REWARD_DRAW
+                        # → 對手也需要 REWARD_DRAW
+                        opponent_color = self._get_player_color(1 - current_turn)
+                        self._add_reward_to_memory(opponent_color, self.cfg.REWARD_DRAW, terminal=True)
+                        opponent_key = 'red' if opponent_color == self.cfg.COLOR_RED else 'black'
+                        ep_rewards[opponent_key] += self.cfg.REWARD_DRAW
                     
                     break
-                
-                    
-                    
-                
-            print("目前集數:",i_episode)
-            print("紅方獎勵:",episodic_red_reward)
-            print("黑方獎勵:",episodic_black_reward)
-            print("*"*120)
+
+            # --- 計算本局獎勵 (單局追蹤) ---
+            episodic_red_reward = ep_rewards['red']
+            episodic_black_reward = ep_rewards['black']
+            episodic_reward = episodic_red_reward + episodic_black_reward
+
+            # --- 記錄到診斷工具 ---
+            self.diagnostics.log_episode(
+                i_episode, episodic_reward, episodic_red_reward, episodic_black_reward,
+                step_count, self.env.winner, self.env.my_color
+            )
             
-            # Update Model
+            # --- Update Model ---
             if i_episode % self.cfg.UPDATE_FREQ == 0:
-                # 你可以選擇把兩個 memory 合併，或者分開 update
-                # 這裡建議分開呼叫，邏輯比較簡單清晰
+                diag_red = {}
+                diag_black = {}
                 
-                # 更新紅方經驗 (學習如何贏)
+                # [修正 Bug 1] 紅方與黑方都要更新
                 if len(self.memory_red.states) > 0:
-                    self.agent.update(self.memory_red)
+                    diag_red = self.agent.update(self.memory_red)
                 
-                # 更新黑方經驗 (學習如何不輸)
-                # if len(self.memory_black.states) > 0:
-                #     self.agent.update(self.memory_black)
+                if len(self.memory_black.states) > 0:
+                    diag_black = self.agent.update(self.memory_black)
+                
+                # 合併診斷指標 (取平均)
+                combined_diag = {}
+                diag_list = [d for d in [diag_red, diag_black] if d]
+                if diag_list:
+                    all_keys = diag_list[0].keys()
+                    for k in all_keys:
+                        combined_diag[k] = sum(d.get(k, 0) for d in diag_list) / len(diag_list)
+                    self.diagnostics.log_update(i_episode, combined_diag)
                 
                 # 清空記憶
                 self.memory_red.clear_memory()
                 self.memory_black.clear_memory()
             
-            # Update UI
+            # --- 定期印出診斷摘要 + 更新 UI ---
             if i_episode % self.cfg.PRINT_FREQ == 0:
+                self.diagnostics.print_summary(i_episode)
+                
                 # 使用 after 在主執行緒更新 UI
                 self.root.after(0, lambda ep=i_episode, r=episodic_reward: self.update_train_ui(ep, r))
                 # 稍微畫一下最後的盤面讓使用者看到有在動
@@ -342,48 +430,13 @@ class DarkChessGUI:
 
 
             if i_episode % self.cfg.CHECKPOINT_IDNEX == 0:
-                self.agent.save_model(self.cfg.SAVE_PATH + f"./model_{i_episode /self.cfg.CHECKPOINT_IDNEX}.pt")
+                self.agent.save_model(os.path.join(self.cfg.SAVE_PATH, f"model_{i_episode / self.cfg.CHECKPOINT_IDNEX}.pt"))
 
         self.training_running = False
         self.root.after(0, lambda: self.lbl_status.config(text="訓練完成！"))
 
     def update_train_ui(self, ep, r):
         self.lbl_status.config(text=f"Episode: {ep}, Reward: {r:.2f}")
-    
-    def assign_draw_punishment(self, current_turn):
-        """
-        當發生和局時，除了當前行動者(已在step獲得懲罰)，也要懲罰上一手(等待中)的玩家。
-        """
-        waiting_player = 1 - current_turn
-        draw_penalty = self.cfg.REWARD_DRAW
-        
-        if waiting_player == self.cfg.COLOR_RED:
-            if len(self.memory_red.rewards) > 0:
-                self.memory_red.rewards[-1] += draw_penalty
-                self.memory_red.is_terminals[-1] = True
-        else:
-            if len(self.memory_black.rewards) > 0:
-                self.memory_black.rewards[-1] += draw_penalty
-                self.memory_black.is_terminals[-1] = True
-    
-    def assign_loser_punishment(self, winner_color):
-        """
-        只負責懲罰輸家。
-        因為贏家的獎勵在 env.step() 裡已經拿到了 (REWARD_WIN)。
-        """
-        lose_reward = self.cfg.REWARD_LOSE # 例如 -10
-        
-        # 如果紅方贏了，黑方(上一手)需要被懲罰
-        if winner_color == self.cfg.COLOR_RED:
-            if len(self.memory_black.rewards) > 0:
-                self.memory_black.rewards[-1] += lose_reward
-                self.memory_black.is_terminals[-1] = True
-        
-        # 如果黑方贏了，紅方(上一手)需要被懲罰
-        elif winner_color == self.cfg.COLOR_BLACK:
-            if len(self.memory_red.rewards) > 0:
-                self.memory_red.rewards[-1] += lose_reward
-                self.memory_red.is_terminals[-1] = True
 
 if __name__ == "__main__":
     root = tk.Tk()
