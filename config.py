@@ -21,7 +21,7 @@ class GameConfig:
         self.HIDDEN_DIM_2 = 128 # 第二層隱藏層
 
         # --- 獎勵機制 (Rewards) ---
-        self.REWARD_FLIP = 0.005     # 翻牌獎勵 (鼓勵開局)
+        self.REWARD_FLIP = 0.002     # 翻牌獎勵 (鼓勵開局)
         self.REWARD_MOVE = -0.01     # 普通移動
         self.REWARD_EAT = 1.0        # 吃子獎勵 (提高以鼓勵進攻)
         self.REWARD_WIN = 10.0      # 獲勝獎勵
@@ -37,7 +37,7 @@ class GameConfig:
         # --- 訓練設定 ---
         self.MAX_EPISODES = 10000    # 總訓練局數
 
-        self.UPDATE_FREQ = 10       # 每幾局更新一次網路
+        self.UPDATE_FREQ = 1       # 每幾局更新一次網路
         self.PRINT_FREQ = 50        # 每幾局印出一次 Log
 
         # 棋子編碼
@@ -60,6 +60,6 @@ class GameConfig:
             self.HIDDEN: '0', self.EMPTY: ''
         }
 
-        self.CELL_SIZE = 80
+        self.CELL_SIZE = 90
         self.SAVE_PATH ='Save'
         self.CHECKPOINT_IDNEX = 100

@@ -33,7 +33,8 @@ class DarkChessGUI:
         self.canvas = tk.Canvas(self.frame_container, width=c_w, height=c_h, bg="#D2B48C")
         self.canvas.pack(side=tk.LEFT)
         
-        self.panel = tk.Frame(self.frame_container)
+        self.panel = tk.Frame(self.frame_container, width=250)
+        self.panel.pack_propagate(False)
         self.panel.pack(side=tk.RIGHT, fill=tk.Y, padx=10)
         
         self.btn_train = tk.Button(self.panel, text="開始自我對弈訓練", command=self.start_training)
@@ -42,7 +43,7 @@ class DarkChessGUI:
         self.btn_play = tk.Button(self.panel, text="與 AI 對戰 (人先手)", command=self.start_game_vs_ai)
         self.btn_play.pack(pady=10)
         
-        self.lbl_status = tk.Label(self.panel, text="準備就緒", wraplength=150, font=("Arial", 12))
+        self.lbl_status = tk.Label(self.panel, text="準備就緒", wraplength=180, font=("Arial", 12))
         self.lbl_status.pack(pady=20)
 
         self.turn_status = tk.Label(self.panel, text="", wraplength=150, font=("Arial", 12))
@@ -185,10 +186,11 @@ class DarkChessGUI:
         if self.env.game_over:
             return
         
-        state, turn = self.env.get_state()
+        state, turn, eaten_state = self.env.get_state()
         mask = self.env.get_legal_actions(turn)
-        action = self.agent.evaluate_action(state, turn, mask)        
+        action = self.agent.evaluate_action(state, turn, mask, eaten_state)        
         obs, reward, done, info = self.env.step(action)
+        
         self.draw_board()
         self.lbl_status.config(text="輪到你了")
         
@@ -208,7 +210,7 @@ class DarkChessGUI:
         self.env.reset()
         self.human_playing = True
         self.selected_pos = None
-        self.agent.load_model("C:\workspace\chinesechess\Save\model_22.0.pt")
+        self.agent.load_model("C:\workspace\ChineseChess\ChineseChess\Save\model_12.0.pt")
         self.draw_board()
         self.lbl_status.config(text="遊戲開始！請點選棋子")
         self.canvas.bind("<Button-1>", self.canvas_click)
@@ -229,11 +231,8 @@ class DarkChessGUI:
             
             if not self.training_running: 
                 break
-            
 
-
-            state_obs, _ = self.env.reset()
-            state = state_obs
+            state, _, eaten_state = self.env.reset()
             episodic_reward = 0
             episodic_red_reward = 0
             episodic_black_reward = 0
@@ -242,7 +241,7 @@ class DarkChessGUI:
             last_mask_black = None
 
             while True:
-                current_turn = self.env.turn 
+                current_turn = self.env.turn
                 mask = self.env.get_legal_actions(current_turn)
 
                 if not any(mask): # 如果沒有任何 True
@@ -256,10 +255,12 @@ class DarkChessGUI:
                     break
 
                 # [修正] 訓練時傳入 Turn
-                action, log_prob = self.agent.select_action(state, current_turn, mask)
+                action, log_prob = self.agent.select_action(state, current_turn, mask, eaten_state)
                 
                 next_state_info, reward, done, _ = self.env.step(action)
-                next_state, next_turn = next_state_info
+                next_state, next_turn, next_eaten_state = next_state_info
+                
+
                 
                 # 4. [雙記憶體儲存邏輯]
                 # 我們將資料存入「當前行動者」的記憶體中
@@ -267,6 +268,7 @@ class DarkChessGUI:
                 
                 if current_turn == 0: # 紅方
                     self.memory_red.states.append(torch.FloatTensor(state))
+                    self.memory_red.eaten_states.append(torch.FloatTensor(eaten_state))
                     self.memory_red.turns.append(current_turn)
                     self.memory_red.masks.append(torch.BoolTensor(mask))
                     self.memory_red.actions.append(torch.tensor(action))
@@ -276,6 +278,7 @@ class DarkChessGUI:
                     episodic_red_reward += reward
                 else: # 黑方
                     self.memory_black.states.append(torch.FloatTensor(state))
+                    self.memory_black.eaten_states.append(torch.FloatTensor(eaten_state))
                     self.memory_black.turns.append(current_turn)
                     self.memory_black.masks.append(torch.BoolTensor(mask))
                     self.memory_black.actions.append(torch.tensor(action))
@@ -286,7 +289,8 @@ class DarkChessGUI:
 
                 episodic_reward += reward
                 state = next_state
-                
+                eaten_state = next_eaten_state
+
                 # 5. [處理正常結束] (例如清空棋子或步數上限)
                 if done:
                     print("self.env.winner:", self.env.winner,"最後獎勵為:",reward)
@@ -321,8 +325,8 @@ class DarkChessGUI:
                     self.agent.update(self.memory_red)
                 
                 # 更新黑方經驗 (學習如何不輸)
-                if len(self.memory_black.states) > 0:
-                    self.agent.update(self.memory_black)
+                # if len(self.memory_black.states) > 0:
+                #     self.agent.update(self.memory_black)
                 
                 # 清空記憶
                 self.memory_red.clear_memory()

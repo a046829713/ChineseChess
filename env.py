@@ -24,7 +24,11 @@ class DarkChessEnv:
         pieces.extend([1]*1 + [2]*2 + [3]*2 + [4]*2 + [5]*2 + [6]*2 + [7]*5)
         pieces.extend([8]*1 + [9]*2 + [10]*2 + [11]*2 + [12]*2 + [13]*2 + [14]*5)
         random.shuffle(pieces)
+
         self.actual_board = np.array(pieces)
+
+        self.eaten_pieces_count = [0] * 15
+        self.state_key = tuple()
 
     def reset(self):
         self.__init__(self.cfg)
@@ -39,7 +43,7 @@ class DarkChessEnv:
         return self.state_history[state_key]
 
     def get_state(self):
-        return self.board.copy(), self.turn
+        return self.board.copy(), self.turn, self.eaten_pieces_count + [self.state_history.get(self.state_key, 0)]
 
     def _pos_to_coord(self, pos):
         return divmod(pos, self.cfg.BOARD_WIDTH)
@@ -55,7 +59,6 @@ class DarkChessEnv:
             return False
             
         current_color = self.my_color if player_idx == 0 else (1 - self.my_color)
-        
         is_red = (piece in self.cfg.RED_PIECES)
         if current_color == self.cfg.COLOR_RED and is_red: return True
         if current_color == self.cfg.COLOR_BLACK and not is_red: return True
@@ -166,6 +169,38 @@ class DarkChessEnv:
         is_target_red = (target_piece in self.cfg.RED_PIECES)
         return is_me_red != is_target_red
 
+    def _is_piece_attacking(self, src):
+        """檢查位於 src 的棋子是否正在攻擊任何敵人"""
+        piece = self.board[src]
+        if piece == self.cfg.EMPTY or piece == self.cfg.HIDDEN:
+            return False
+            
+        # 掃描所有格子，看是否能吃子
+        for dst in range(self.cfg.NUM_PIECES):
+            if src == dst: continue
+            
+            target_piece = self.board[dst]
+            if target_piece == self.cfg.EMPTY or target_piece == self.cfg.HIDDEN:
+                continue
+                
+            # 必須是敵人
+            if not self._is_enemy(piece, target_piece):
+                continue
+                
+            # 必須符合移動/吃子規則
+            # 注意: _check_move_rule 裡已經包含了 _can_eat 的邏輯 (針對非炮類)
+            # 但針對炮類，_check_move_rule 負責路徑和炮架，_can_eat 負責階級
+            # 為了保險，我們這兩個都檢查
+            if self._check_move_rule(src, dst, piece):
+                # 修正：如果是炮(6 或 13)，只要 move_rule 過了就算攻擊，不檢查階級
+                if piece == 6 or piece == 13:
+                    return True
+                
+                # 所以為了統一，我們手動再檢查一次 _can_eat
+                if self._can_eat(piece, target_piece):
+                    return True
+        return False
+
     def _can_eat(self, attacker, victim):
         """階級吃子規則"""
         if not self._is_enemy(attacker, victim):
@@ -184,11 +219,15 @@ class DarkChessEnv:
         if a_rank == 7 and v_rank == 1: return True
         return a_rank <= v_rank
 
+
+    def _update_eaten_pieces_count(self, eaten_piece):
+        self.eaten_pieces_count[eaten_piece] += 1
+
     def step(self, action):
         # 解析動作
         src = action // self.cfg.NUM_PIECES
         dst = action % self.cfg.NUM_PIECES
-        
+ 
         reward = 0
         done = False
         info = {}
@@ -229,7 +268,9 @@ class DarkChessEnv:
                 self.no_capture_count += 1
             else:
                 # 吃子
+                self._update_eaten_pieces_count(self.board[dst])
                 self.board[dst] = piece
+                
                 self.board[src] = self.cfg.EMPTY
                 reward = self.cfg.REWARD_EAT
                 self.no_capture_count = 0
@@ -237,14 +278,26 @@ class DarkChessEnv:
         # --- 檢查重複局面 (長捉/長將禁手判斷) ---
         # 預判下一個狀態 (因為 step 結尾才會切換 turn，這裡先模擬切換後的狀態 key)
         next_turn = 1 - self.turn
-        state_key = (tuple(self.board), next_turn)
-        self.state_history[state_key] = self.state_history.get(state_key, 0) + 1
+        self.state_key = (tuple(self.board), next_turn)
         
-        if self.state_history[state_key] >= 3:
-            # 如果同一局面重複 3 次，判定當前行動者(造成重複的人)判負 (禁手)
-            self.game_over = True
-            self.winner = next_turn # 對手獲勝
-            reward = self.cfg.REWARD_LOSE # 給予當前玩家懲罰
+        self.state_history[self.state_key] = self.state_history.get(self.state_key, 0) + 1
+        
+        if self.state_history[self.state_key] >= 3:
+            # 如果同一局面重複 3 次
+            # 判斷是「長捉/長將」(Perpetual Chase) 還是「閒著/雙方互走」(Mutual Repetition)
+            
+            # 剛剛移動的棋子位置是 dst
+            # 檢查這步棋是否造成了攻擊 (捉/將)
+            if self._is_piece_attacking(dst):
+                 # 長捉/長將 -> 判負 (禁手)
+                self.game_over = True
+                self.winner = next_turn # 對手獲勝 (1 - self.turn)
+                reward = self.cfg.REWARD_LOSE # 給予當前玩家懲罰
+            else:
+                # 閒著/無意義重複 -> 和局
+                self.game_over = True
+                self.winner = None # 和局
+                reward = self.cfg.REWARD_DRAW
         
         # --- 判定勝負 ---
         self._check_game_over(reward)

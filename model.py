@@ -13,6 +13,7 @@ class Memory:
     def __init__(self):
         self.actions = []
         self.states = []
+        self.eaten_states =[]
         self.logprobs = []
         self.rewards = []
         self.is_terminals = []
@@ -22,6 +23,7 @@ class Memory:
     def clear_memory(self):
         del self.actions[:]
         del self.states[:]
+        del self.eaten_states[:]
         del self.logprobs[:]
         del self.rewards[:]
         del self.is_terminals[:]
@@ -84,7 +86,7 @@ class ActorCritic(nn.Module):
         # CNN 輸出扁平化後的維度: 64通道 * 4高 * 8寬 = 2048
         self.flatten_dim = self.conv_channels * self.board_h * self.board_w
         # 加上 Turn 的 embedding 維度
-        self.fc_input_dim = self.flatten_dim + 16 
+        self.fc_input_dim = self.flatten_dim + 16 + 16
         
         self.fc_shared = nn.Linear(self.fc_input_dim, 512)
         
@@ -103,12 +105,13 @@ class ActorCritic(nn.Module):
             nn.Linear(128, 1)
         )
 
-    def forward(self, state, turn):
+    def forward(self, state, turn, eaten_state):
         # state shape: (Batch, 32) -> Flattened integers
         
         # 1. 預處理 State
         state = state.clone().detach().long()
         state[state == -1] = 15 # 處理 Hidden
+        
         # Reshape 回 2D 棋盤: (Batch, 4, 8)
         # 注意: 你的 Config 必須確保 NUM_PIECES = 32 = 4*8
         batch_size = state.size(0)
@@ -128,7 +131,6 @@ class ActorCritic(nn.Module):
         # 4. Flatten
         x = x.flatten(start_dim=1)
   
-        
         # 5. 加入 Turn 資訊
         if isinstance(turn, int):
             turn = torch.tensor([turn], device=state.device)
@@ -138,11 +140,13 @@ class ActorCritic(nn.Module):
                  turn = turn.expand(batch_size)
         
         
-        
         turn_embed = self.turn_embedding(turn).view(batch_size, -1)
+
+        
 
         # 拼接 (Board Features + Turn Features)
         x = torch.cat([x, turn_embed], dim=1)
+        x = torch.cat([x, eaten_state], dim=1)
         
         # 6. Shared FC
         x = F.relu(self.fc_shared(x))
@@ -163,34 +167,37 @@ class PPOAgent:
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.MseLoss = nn.MSELoss()
 
-    def select_action(self, state, turn, mask):
+    def select_action(self, state, turn, mask, eaten_state):
         state_t = torch.LongTensor(state).unsqueeze(0)
         turn_t = torch.LongTensor([turn])
         mask_t = torch.BoolTensor(mask).unsqueeze(0)
-        
+        eaten_state_t = torch.LongTensor(eaten_state).unsqueeze(0)
+
 
         with torch.no_grad():
-            logits, _ = self.policy_old(state_t, turn_t)
+            logits, _ = self.policy_old(state_t, turn_t, eaten_state_t)
             logits[~mask_t] = -float('inf')
-            dist = Categorical(F.softmax(logits, dim=1))
+            dist = Categorical(logits=logits)
             action = dist.sample()
+
         return action.item(), dist.log_prob(action).item()
 
 
-    def evaluate_action(self, state, turn, mask):
+    def evaluate_action(self, state, turn, mask, eaten_state):
         """
             評估模式：不進行隨機抽樣，直接選擇機率最大的合法動作。
         """
         state_t = torch.LongTensor(state).unsqueeze(0).to(self.device)
         turn_t = torch.LongTensor([turn]).to(self.device)
         mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.device)
+        eaten_state_t = torch.LongTensor(eaten_state).unsqueeze(0).to(self.device)
 
         # 切換到評估模式 (影響 BatchNorm/Dropout 等)
         self.policy.eval()
 
         with torch.no_grad():
             # 評估時直接用最新的 policy 網路
-            logits, _ = self.policy(state_t, turn_t)
+            logits, _ = self.policy(state_t, turn_t, eaten_state_t)
             
             # 一樣要 Mask 掉不合法的動作
             logits[~mask_t] = -float('inf')
@@ -216,18 +223,24 @@ class PPOAgent:
             rewards.insert(0, discounted_reward)
 
         rewards = torch.tensor(rewards, dtype=torch.float32)
+        
+
 
         if rewards.std() > 1e-5:
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
         
         old_states = torch.stack(memory.states).detach()
+        old_eaten_states = torch.stack(memory.eaten_states).detach()
+
+
         old_turns = torch.tensor(memory.turns, dtype=torch.long) # 處理 Turn
+        
         old_actions = torch.stack(memory.actions).detach()
         old_logprobs = torch.stack(memory.logprobs).detach()
         old_masks = torch.stack(memory.masks).detach() # 處理 Mask
 
         for _ in range(self.cfg.K_EPOCHS):
-            logprobs, state_values = self.policy(old_states, old_turns)
+            logprobs, state_values = self.policy(old_states, old_turns, old_eaten_states)
             logprobs[~old_masks] = -float('inf') # Apply Mask
             
             dist = Categorical(F.softmax(logprobs, dim=1))
@@ -244,9 +257,10 @@ class PPOAgent:
             
             self.optimizer.zero_grad()
             loss.mean().backward()
-            # self.checkgrad(self.policy)
+            self.checkgrad(self.policy)
 
             self.optimizer.step()
+        
         self.policy_old.load_state_dict(self.policy.state_dict())
     
     # --- 新增：儲存模型 ---
