@@ -214,7 +214,7 @@ class DarkChessGUI:
         self.env.reset()
         self.human_playing = True
         self.selected_pos = None
-        self.agent.load_model("C:\\workspace\\ChineseChess\\ChineseChess\\Save\\model_22.0.pt")
+        self.agent.load_model("C:\\workspace\\ChineseChess\\ChineseChess\\Save\\model_32.0.pt")
         self.draw_board()
         self.lbl_status.config(text="遊戲開始！請點選棋子")
         self.canvas.bind("<Button-1>", self.canvas_click)
@@ -257,8 +257,10 @@ class DarkChessGUI:
     # =========================================================================
     def _add_reward_to_memory(self, color, reward_value, terminal=False):
         """
-        將額外獎勵加到指定顏色玩家的最後一步記憶中。
-        用於遊戲結束時為非當前行動者分配勝負/和局獎勵。
+            將額外獎勵加到指定顏色玩家的最後一步記憶中。
+            用於遊戲結束時為非當前行動者分配勝負/和局獎勵。
+
+            亦可用於需要額外懲罰的情況。
         """
         if color == self.cfg.COLOR_RED:
             if len(self.memory_red.rewards) > 0:
@@ -314,7 +316,11 @@ class DarkChessGUI:
                 action, log_prob = self.agent.select_action(state, current_turn, mask, eaten_state)
                 
                 # 執行動作
-                next_state_info, reward, done, _ = self.env.step(action)
+                next_state_info, reward, done, info = self.env.step(action)
+
+                print(next_state_info[0])
+                print("*"*120)
+
                 next_state, next_turn, next_eaten_state = next_state_info
                 step_count += 1
 
@@ -324,6 +330,9 @@ class DarkChessGUI:
                 # 但 turn=0 不一定是紅方！必須透過 my_color 映射。
                 # =============================================================
                 current_color = self._get_player_color(current_turn)
+
+                
+                
                 color_key = 'red' if current_color == self.cfg.COLOR_RED else 'black'
                 ep_rewards[color_key] += reward  # 追蹤單局獎勵
                 
@@ -349,6 +358,15 @@ class DarkChessGUI:
                 state = next_state
                 eaten_state = next_eaten_state
 
+
+                if info.get("Eaten_reward", 0 ) != 0:
+                    opponent_color = self._get_player_color(1 - current_turn)
+                    opponent_key = 'red' if opponent_color == self.cfg.COLOR_RED else 'black'
+                    self._add_reward_to_memory(self._get_player_color(1 - current_turn), info.get("Eaten_reward", 0 ), terminal=False)
+                    ep_rewards[opponent_key] += self.cfg.REWARD_EATEN
+
+
+                
                 # --- 遊戲正常結束 (吃光棋子、步數上限、重複局面) ---
                 if done:
                     if self.env.winner is not None:

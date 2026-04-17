@@ -273,6 +273,8 @@ class DarkChessEnv:
                 
                 self.board[src] = self.cfg.EMPTY
                 reward = self.cfg.REWARD_EAT
+
+                info["Eaten_reward"] = self.cfg.REWARD_EATEN
                 self.no_capture_count = 0
 
         # --- 檢查重複局面 (長捉/長將禁手判斷) ---
@@ -292,12 +294,14 @@ class DarkChessEnv:
                  # 長捉/長將 -> 判負 (禁手)
                 self.game_over = True
                 self.winner = next_turn # 對手獲勝 (1 - self.turn)
-                reward = self.cfg.REWARD_LOSE # 給予當前玩家懲罰
+                reward += self.cfg.REWARD_LOSE # 給予當前玩家懲罰
+
+                time.sleep(100)
             else:
                 # 閒著/無意義重複 -> 和局
                 self.game_over = True
                 self.winner = None # 和局
-                reward = self.cfg.REWARD_DRAW
+                reward += self.cfg.REWARD_DRAW
         
         # --- 判定勝負 ---
         self._check_game_over(reward)
@@ -313,14 +317,16 @@ class DarkChessEnv:
         
         # 簡單勝負判定：如果場上沒有某一色的棋子且沒有蓋牌 -> 輸
         # (完整的暗棋還有逼和規則，這裡簡化處理)
-        if hidden_count == 0:
+        if hidden_count == 0:                       
             if not visible_red:
                 self.winner = self.cfg.COLOR_BLACK
                 self.game_over = True
+
             elif not visible_black:
                 self.winner = self.cfg.COLOR_RED
                 self.game_over = True
-        
+
+
         if self.no_capture_count >= 60:
             self.game_over = True
             self.winner = None # 和局
@@ -346,27 +352,23 @@ if __name__ == "__main__":
     while True:
         print("目前局數:",index)
         env = DarkChessEnv()
-        s, t = env.reset()
+        s, t, _= env.reset()
         # print("Initial Board (Hidden):")
         
         
         # 隨機測試
         while True:
-            mask = env.get_legal_actions(env.turn)
+            print(env.board)
+            print("*"*120)
 
+
+            mask = env.get_legal_actions(env.turn)
             legal_indices = np.where(mask)[0]
             
-            if len(legal_indices) == 0:
-                print(np.where(mask))
-                print(env.board.reshape(env.cfg.BOARD_HEIGHT, env.cfg.BOARD_WIDTH))
-                print(env.turn)
-                print("No legal moves!")
-                time.sleep(1000)
-                break
-                
             action = np.random.choice(legal_indices)
             state, reward, done, _ = env.step(action)
             
+            print("是否完成:",done)
             if done:
                 print("Game Over")
                 break
