@@ -23,6 +23,15 @@ class DarkChessGUI:
         self.env = DarkChessEnv(self.cfg)        
         self.agent = PPOAgent(self.cfg) 
 
+        # self.pre_train_path = "C:\\workspace\\ChineseChess\\ChineseChess\\Save\\model_100.0.pt"
+        
+        # if self.pre_train_path:
+        #     self.i_episode = 100 *100
+        #     self.agent.load_model(self.pre_train_path)
+        #     self.agent.policy_old.load_state_dict(self.agent.policy.state_dict())
+
+        self.i_episode = 0
+
         self.memory_red = Memory()   # 專存紅方的 (s, a, r)
         self.memory_black = Memory() # 專存黑方的 (s, a, r)
         
@@ -57,6 +66,7 @@ class DarkChessGUI:
         self.human_playing = False
         self.training_running = False
         
+
         self.draw_board()
 
     def check_file(self):
@@ -174,7 +184,7 @@ class DarkChessGUI:
             self.draw_board()
             return
             
-        obs, reward, done, info = self.env.step(action)
+        obs, reward, done, info = self.env.step(action, i_episode=0)
         self.selected_pos = None
         self.draw_board()
         
@@ -193,7 +203,7 @@ class DarkChessGUI:
         state, turn, eaten_state = self.env.get_state()
         mask = self.env.get_legal_actions(turn)
         action = self.agent.evaluate_action(state, turn, mask, eaten_state)        
-        obs, reward, done, info = self.env.step(action)
+        obs, reward, done, info = self.env.step(action,i_episode=0)
         
         self.draw_board()
         self.lbl_status.config(text="輪到你了")
@@ -202,10 +212,14 @@ class DarkChessGUI:
             self.show_winner()
 
     def show_winner(self):
-        winner_color = self.env.winner
-        if winner_color == self.cfg.COLOR_RED: w_txt = "紅方"
-        elif winner_color == self.cfg.COLOR_BLACK: w_txt = "黑方"
-        else: w_txt = "和局"
+        winner_turn = self.env.winner
+        if winner_turn is None:
+            w_txt = "和局"
+        else:
+            winner_color = self._get_player_color(winner_turn)
+            if winner_color == self.cfg.COLOR_RED: w_txt = "紅方"
+            elif winner_color == self.cfg.COLOR_BLACK: w_txt = "黑方"
+            else: w_txt = "和局"
         messagebox.showinfo("遊戲結束", f"結果: {w_txt} 獲勝")
         self.human_playing = False
 
@@ -214,7 +228,7 @@ class DarkChessGUI:
         self.env.reset()
         self.human_playing = True
         self.selected_pos = None
-        self.agent.load_model("C:\\workspace\\ChineseChess\\ChineseChess\\Save\\model_32.0.pt")
+        self.agent.load_model("C:\\workspace\\ChineseChess\\ChineseChess\\Save\\model_9.0.pt")
         self.draw_board()
         self.lbl_status.config(text="遊戲開始！請點選棋子")
         self.canvas.bind("<Button-1>", self.canvas_click)
@@ -277,7 +291,10 @@ class DarkChessGUI:
     # 主訓練迴圈 (修正版)
     # =========================================================================
     def train_loop(self):
-        for i_episode in range(1, self.cfg.MAX_EPISODES + 1):
+        i_episode = self.i_episode
+        while True:
+            i_episode += 1
+        # for i_episode in range(1, self.cfg.MAX_EPISODES + 1):
             
             if not self.training_running: 
                 break
@@ -309,17 +326,15 @@ class DarkChessGUI:
                     ep_rewards[winner_key] += self.cfg.REWARD_WIN
                     
                     self.env.game_over = True
-                    self.env.winner = winner_color
+                    self.env.winner = winner_turn
                     break
 
                 # 選擇動作
                 action, log_prob = self.agent.select_action(state, current_turn, mask, eaten_state)
                 
                 # 執行動作
-                next_state_info, reward, done, info = self.env.step(action)
-
-                print(next_state_info[0])
-                print("*"*120)
+                # i_episode 用於顯示當前訓練拚次編號
+                next_state_info, reward, done, info = self.env.step(action, i_episode)
 
                 next_state, next_turn, next_eaten_state = next_state_info
                 step_count += 1
@@ -369,18 +384,21 @@ class DarkChessGUI:
                 
                 # --- 遊戲正常結束 (吃光棋子、步數上限、重複局面) ---
                 if done:
+                    print("遊戲勝利者:",self.env.winner)
                     if self.env.winner is not None:
                         # =================================================
                         # [修正] 正確分配勝負獎勵
                         # env.step() 已經給當前行動者獎勵 (WIN 或 LOSE)
                         # 這裡只需要處理「對手」(非當前行動者) 的獎勵
                         # =================================================
-                        winner_color = self.env.winner
+                        winner_turn = self.env.winner
+
+                        
                         current_color = self._get_player_color(current_turn)
                         opponent_color = self._get_player_color(1 - current_turn)
                         
                         opponent_key = 'red' if opponent_color == self.cfg.COLOR_RED else 'black'
-                        if current_color == winner_color:
+                        if current_turn == winner_turn:
                             # 當前行動者贏了 (已從 step 拿到 REWARD_WIN)
                             # → 對手輸了，需要加 LOSE 到對手的最後一步
                             self._add_reward_to_memory(opponent_color, self.cfg.REWARD_LOSE, terminal=True)
@@ -391,13 +409,13 @@ class DarkChessGUI:
                             self._add_reward_to_memory(opponent_color, self.cfg.REWARD_WIN, terminal=True)
                             ep_rewards[opponent_key] += self.cfg.REWARD_WIN
                     else:
+
                         # 和局：當前行動者已從 step 拿到 REWARD_DRAW
                         # → 對手也需要 REWARD_DRAW
                         opponent_color = self._get_player_color(1 - current_turn)
                         self._add_reward_to_memory(opponent_color, self.cfg.REWARD_DRAW, terminal=True)
                         opponent_key = 'red' if opponent_color == self.cfg.COLOR_RED else 'black'
                         ep_rewards[opponent_key] += self.cfg.REWARD_DRAW
-                    
                     break
 
             # --- 計算本局獎勵 (單局追蹤) ---
@@ -406,13 +424,17 @@ class DarkChessGUI:
             episodic_reward = episodic_red_reward + episodic_black_reward
 
             # --- 記錄到診斷工具 ---
+            log_winner_color = None
+            if self.env.winner is not None:
+                log_winner_color = self._get_player_color(self.env.winner)
+            
             self.diagnostics.log_episode(
                 i_episode, episodic_reward, episodic_red_reward, episodic_black_reward,
-                step_count, self.env.winner, self.env.my_color
+                step_count, log_winner_color, self.env.my_color
             )
             
             # --- Update Model ---
-            if i_episode % self.cfg.UPDATE_FREQ == 0:
+            if i_episode % self.cfg.UPDATE_FREQ == 0 :
                 diag_red = {}
                 diag_black = {}
                 

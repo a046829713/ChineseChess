@@ -5,7 +5,7 @@ from torch.distributions import Categorical
 from config import GameConfig
 import torch
 import numpy as np
-
+import time
 # 簡單的 Memory 類別，用來儲存訓練數據
 class Memory:
     def __init__(self):
@@ -83,8 +83,11 @@ class ActorCritic(nn.Module):
         # --- 4. 全連接層準備 ---
         # CNN 輸出扁平化後的維度: 64通道 * 4高 * 8寬 = 2048
         self.flatten_dim = self.conv_channels * self.board_h * self.board_w
+        
+        
         # 加上 Turn 的 embedding 維度
-        self.fc_input_dim = self.flatten_dim + 16 + 16
+        # turn 16 , no_capture_count 1 eaten_pieces_count 16
+        self.fc_input_dim = self.flatten_dim + 16 + 1 + 16
         
         self.fc_shared = nn.Linear(self.fc_input_dim, 512)
         
@@ -137,13 +140,9 @@ class ActorCritic(nn.Module):
              if turn.size(0) != batch_size:
                  turn = turn.expand(batch_size)
         
-        
-        turn_embed = self.turn_embedding(turn).view(batch_size, -1)
 
-        
-
-        # 拼接 (Board Features + Turn Features)
-        x = torch.cat([x, turn_embed], dim=1)
+        # # 拼接 (Board Features + Turn Features)
+        x = torch.cat([x, self.turn_embedding(turn)], dim=1)
         x = torch.cat([x, eaten_state], dim=1)
         
         # 6. Shared FC
@@ -212,95 +211,103 @@ class PPOAgent:
 
     def update(self, memory):
         """
-        PPO 更新，回傳診斷指標 dict。
-        
-        修正內容：
-        - Bug 4: Categorical 改用 logits= (避免雙重 softmax)
-        - 新增梯度裁剪 (gradient clipping)
-        - 新增診斷指標回傳
-        - rewards 使用 append+reverse 取代 insert(0,...) (O(n) vs O(n²))
+            正規 PPO2 更新 (包含 GAE, 優勢正規化, 價值裁剪)
+
+
         """
         if not memory.rewards: 
             return {}
-        
-        # --- 計算折扣獎勵 (Discounted Rewards) ---
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self.cfg.GAMMA * discounted_reward)
-            rewards.append(discounted_reward)
-        rewards.reverse()  # [修正] O(n) 取代 insert(0,...) 的 O(n²)
-        
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
 
-        # [修正] 固定縮放 returns：除以最大獎勵絕對值
-        # 原本 returns 在 [-8, +30]，critic loss = 0.25 * MSE 會爆炸到 3-6
-        # 縮放後 returns 在 [-0.8, +3]，critic loss 降到合理範圍
-        # 這比 per-batch 正規化更好，因為縮放比例是固定的 → Critic 目標穩定
-        reward_scale = max(abs(self.cfg.REWARD_WIN), abs(self.cfg.REWARD_LOSE))
-        if reward_scale > 0:
-            rewards = rewards / reward_scale
-        
-        # --- 準備訓練資料 (移至正確的 device) ---
-        old_states = torch.stack(memory.states).detach().to(self.device)
-        old_eaten_states = torch.stack(memory.eaten_states).detach().to(self.device)
-        old_turns = torch.tensor(memory.turns, dtype=torch.long).to(self.device)
-        old_actions = torch.stack(memory.actions).detach().to(self.device)
-        old_logprobs = torch.stack(memory.logprobs).detach().to(self.device)
-        old_masks = torch.stack(memory.masks).detach().to(self.device)
+        # --- 1. 準備舊資料並計算舊的價值 (No Grad) ---
+        with torch.no_grad():
+            old_states = torch.stack(memory.states).to(self.device)
+            old_turns = torch.tensor(memory.turns, dtype=torch.long).to(self.device)
+            old_eaten_states = torch.stack(memory.eaten_states).to(self.device)
+            old_actions = torch.stack(memory.actions).to(self.device)
+            old_logprobs = torch.stack(memory.logprobs).to(self.device)
+            old_masks = torch.stack(memory.masks).to(self.device)
+            
+            _, old_state_values = self.policy(old_states, old_turns, old_eaten_states)
+            # 壓平並傳到 CPU 以利順序迴圈計算
+            old_state_values = old_state_values.squeeze(-1)
+            old_values_cpu = old_state_values.cpu()
 
-        # --- PPO 迭代更新 ---
+        # --- 2. 計算 GAE (Generalized Advantage Estimation) ---
+        advantages = []
+        gae = 0
+        gae_lambda = getattr(self.cfg, 'GAE_LAMBDA', 0.95)
+
+        for i in reversed(range(len(memory.rewards))):
+            if memory.is_terminals[i] or i == len(memory.rewards) - 1:
+                next_value = 0.0
+            else:
+                next_value = old_values_cpu[i + 1].item()
+
+            delta = memory.rewards[i] + self.cfg.GAMMA * next_value - old_values_cpu[i].item()
+            gae = delta + self.cfg.GAMMA * gae_lambda * gae * (not memory.is_terminals[i])
+            advantages.append(gae)
+            
+        advantages.reverse()
+        
+        # 轉為 GPU Tensor
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(self.device)
+
+        # --- 3. 計算 Returns (Critic 的目標值) 並正規化 Advantage ---
+        # Returns = Advantages + Old Values
+        returns = advantages + old_state_values 
+
+        # 正規化 Advantage (在 Epoch 迴圈外只做一次)
+        if advantages.numel() > 1 and advantages.std() > 1e-8:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # --- 4. PPO 迭代更新 (K_EPOCHS) ---
         diagnostics = {}
 
         for _ in range(self.cfg.K_EPOCHS):
-            # Forward pass
+            # Forward pass (計算新的 logits 和 values)
             logits, state_values = self.policy(old_states, old_turns, old_eaten_states)
             logits[~old_masks] = -float('inf')  # Apply Mask
+            state_values = state_values.squeeze(-1)
             
-            # [修正 Bug 4] 使用 logits= 關鍵字，避免雙重 softmax
-            # 原本錯誤: Categorical(F.softmax(logprobs, dim=1)) 
-            # softmax 在 Categorical 內部已經做了，外部再做一次會壓平分佈
             dist = Categorical(logits=logits)
             new_logprobs = dist.log_prob(old_actions)
             dist_entropy = dist.entropy()
-            state_values = torch.squeeze(state_values)
             
-            # 計算 PPO Ratio 與 Advantage
+            # --- Actor Loss ---
             ratios = torch.exp(new_logprobs - old_logprobs)
-            advantages = rewards - state_values.detach()
             
-            # [修正] 正規化 Advantage (非 Returns)
-            # 這讓 Actor 的梯度尺度穩定，同時不影響 Critic 的學習目標
-            if advantages.numel() > 1 and advantages.std() > 1e-8:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            
-            # PPO Clipped Surrogate Loss
             surr1 = ratios * advantages
+
             surr2 = torch.clamp(ratios, 1-self.cfg.EPS_CLIP, 1+self.cfg.EPS_CLIP) * advantages
-            
-            # 分解 Loss 用於診斷
             actor_loss = -torch.min(surr1, surr2).mean()
-            # [修正] Critic 係數 0.5 → 0.25 (防止 critic loss 主導梯度)
-            critic_loss = 0.25 * self.MseLoss(state_values, rewards)
-            # [修正] Entropy 係數 0.01 → 0.02 (維持足夠的探索)
+            
+            # --- Critic Loss (導入 PPO2 標準的 Value Clipping) ---
+            # 這是為了防止 Critic 在一個 epoch 內更新幅度過大
+            value_loss_unclipped = (state_values - returns) ** 2
+            state_values_clipped = old_state_values + torch.clamp(
+                state_values - old_state_values, 
+                -self.cfg.EPS_CLIP, 
+                self.cfg.EPS_CLIP
+            )
+            value_loss_clipped = (state_values_clipped - returns) ** 2
+            # 係數改回標準的 0.5 (因為 GAE 已經大幅降低方差，不需要再壓到 0.25)
+            critic_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+            
+            # --- 總 Loss ---
             entropy_loss = -0.02 * dist_entropy.mean()
             loss = actor_loss + critic_loss + entropy_loss
             
-            # Backpropagation
+            # --- Backpropagation ---
             self.optimizer.zero_grad()
             loss.backward()
-            
-            # [修正] 梯度裁剪 max_norm: 0.5 → 1.0 (0.5 裁剪太激進，抹殺學習訊號)
+            # self.get_weight_stats()
             grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
-            
             self.optimizer.step()
 
-            # --- 收集診斷指標 (最後一個 epoch 的結果) ---
+            # --- KL 早停機制與診斷指標 ---
             with torch.no_grad():
-                clip_fraction = ((ratios - 1.0).abs() > self.cfg.EPS_CLIP).float().mean().item()
                 kl_div = (old_logprobs - new_logprobs).mean().item()
+                clip_fraction = ((ratios - 1.0).abs() > self.cfg.EPS_CLIP).float().mean().item()
                 
                 diagnostics = {
                     'actor_loss': actor_loss.item(),
@@ -314,14 +321,10 @@ class PPOAgent:
                     'advantage_mean': advantages.mean().item(),
                     'ratio_mean': ratios.mean().item(),
                 }
-            
-            # [新增] KL 早停機制：如果 KL divergence 超過目標值就停止迭代
-            # 這是防止策略坍縮最關鍵的機制
-            with torch.no_grad():
-                kl_check = (old_logprobs - new_logprobs).mean().item()
+                
                 if hasattr(self.cfg, 'KL_TARGET') and self.cfg.KL_TARGET is not None:
-                    if abs(kl_check) > self.cfg.KL_TARGET * 1.5:
-                        break
+                    if abs(kl_div) > self.cfg.KL_TARGET * 1.5:
+                        break  # 觸發早停
         
         self.policy_old.load_state_dict(self.policy.state_dict())
         return diagnostics
@@ -338,6 +341,7 @@ class PPOAgent:
                 'max': param.data.max().item(),
                 'norm': param.data.norm().item(),
             }
+        print(stats)
         return stats
 
 

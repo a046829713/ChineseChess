@@ -43,7 +43,7 @@ class DarkChessEnv:
         return self.state_history[state_key]
 
     def get_state(self):
-        return self.board.copy(), self.turn, self.eaten_pieces_count + [self.state_history.get(self.state_key, 0)]
+        return self.board.copy(), self.turn, self.eaten_pieces_count + [self.no_capture_count /10 ] + [self.state_history.get(self.state_key, 0)]
 
     def _pos_to_coord(self, pos):
         return divmod(pos, self.cfg.BOARD_WIDTH)
@@ -223,7 +223,7 @@ class DarkChessEnv:
     def _update_eaten_pieces_count(self, eaten_piece):
         self.eaten_pieces_count[eaten_piece] += 1
 
-    def step(self, action):
+    def step(self, action, i_episode):
         # 解析動作
         src = action // self.cfg.NUM_PIECES
         dst = action % self.cfg.NUM_PIECES
@@ -291,26 +291,24 @@ class DarkChessEnv:
             # 剛剛移動的棋子位置是 dst
             # 檢查這步棋是否造成了攻擊 (捉/將)
             if self._is_piece_attacking(dst):
+                print(f"目前局數: {i_episode} 長捉禁手")
                  # 長捉/長將 -> 判負 (禁手)
                 self.game_over = True
                 self.winner = next_turn # 對手獲勝 (1 - self.turn)
-                reward += self.cfg.REWARD_LOSE # 給予當前玩家懲罰
-
-                time.sleep(100)
             else:
+                print(f"目前局數: {i_episode} 無意義和局")
                 # 閒著/無意義重複 -> 和局
                 self.game_over = True
                 self.winner = None # 和局
-                reward += self.cfg.REWARD_DRAW
-        
+                
         # --- 判定勝負 ---
-        self._check_game_over(reward)
+        self._check_game_over(reward, i_episode)
         reward = self._adjust_reward_for_endgame(reward)
-        
         self.turn = 1 - self.turn
+
         return self.get_state(), reward, self.game_over, info
 
-    def _check_game_over(self, current_reward):
+    def _check_game_over(self, current_reward, i_episode:int):
         visible_red = np.any(np.isin(self.board, self.cfg.RED_PIECES))
         visible_black = np.any(np.isin(self.board, self.cfg.BLACK_PIECES))
         hidden_count = np.sum(self.board == self.cfg.HIDDEN)
@@ -319,31 +317,32 @@ class DarkChessEnv:
         # (完整的暗棋還有逼和規則，這裡簡化處理)
         if hidden_count == 0:                       
             if not visible_red:
-                self.winner = self.cfg.COLOR_BLACK
+                self.winner = 0 if self.my_color == self.cfg.COLOR_BLACK else 1
                 self.game_over = True
 
             elif not visible_black:
-                self.winner = self.cfg.COLOR_RED
+                self.winner = 0 if self.my_color == self.cfg.COLOR_RED else 1
                 self.game_over = True
 
 
         if self.no_capture_count >= 60:
+            print(f"目前局數: {i_episode} , 60步沒有吃到")
             self.game_over = True
             self.winner = None # 和局
 
     def _adjust_reward_for_endgame(self, reward):
         if self.game_over:
             if self.winner is None:
-                return self.cfg.REWARD_DRAW
+                reward += self.cfg.REWARD_DRAW
             
-            # 判斷當前行動者是否獲勝
-            # 注意：step 函式末尾才切換 turn，所以這裡的 self.turn 還是當前行動者
-            current_player_color = self.my_color if self.turn == 0 else (1 - self.my_color)
-            
-            if self.winner == current_player_color:
-                return self.cfg.REWARD_WIN
             else:
-                return self.cfg.REWARD_LOSE
+                # 判斷當前行動者是否獲勝
+                # 注意：step 函式末尾才切換 turn，所以這裡的 self.turn 還是當前行動者
+                if self.winner == self.turn:
+                    reward += self.cfg.REWARD_WIN
+                else:
+                    reward += self.cfg.REWARD_LOSE
+        
         return reward
 
 # 測試代碼
