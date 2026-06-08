@@ -2,8 +2,8 @@ import numpy as np
 import random
 from config import GameConfig
 import time
-
-
+from collections import deque
+import torch
 
 
 class DarkChessEnv:
@@ -12,6 +12,12 @@ class DarkChessEnv:
         self.board = np.full(self.cfg.NUM_PIECES, self.cfg.HIDDEN)
         self.actual_board = np.zeros(self.cfg.NUM_PIECES, dtype=int)
         
+
+
+        # --- [新增] AlphaZero 風格的狀態歷史堆疊 ---
+        self.history_length = 8
+        self.state_buffer = deque(maxlen=self.history_length)
+
         self.turn = 0 # 0: Player 1, 1: Player 2
         self.my_color = self.cfg.COLOR_UNKNOWN
         self.game_over = False
@@ -42,8 +48,52 @@ class DarkChessEnv:
         self.state_history[state_key] = self.state_history.get(state_key, 0) + 1
         return self.state_history[state_key]
 
+    # def get_state(self):
+    #     # --- [修改] 將 8 步的歷史轉換為 NumPy 陣列返回 ---
+    #     # 回傳的 stacked_board shape 為 (8, 32)
+    #     stacked_board = np.array(self.state_buffer)
+        
+    #     return stacked_board, self.turn, self.eaten_pieces_count + [self.no_capture_count /10 ] + [self.state_history.get(self.state_key, 0)]
+
+
     def get_state(self):
-        return self.board.copy(), self.turn, self.eaten_pieces_count + [self.no_capture_count /10 ] + [self.state_history.get(self.state_key, 0)]
+        """
+        將 1D board (長度 32) 轉換為 (18, 4, 8) 的 One-Hot Float Tensor
+        """
+        # 1. 將 1D 棋盤折疊成 2D (4列, 8欄)
+        board_2d = self.board.reshape(4, 8)
+        
+        # 2. 定義所有可能的棋子 ID (共 16 種狀態)
+        # 確保順序固定，神經網路才能認得哪個通道代表什麼
+        piece_ids = [self.cfg.EMPTY, self.cfg.HIDDEN] + list(range(1, 15))
+        
+        # 將 piece_ids 轉為形狀 (16, 1, 1) 以便利用 NumPy 的廣播機制
+        piece_ids_array = np.array(piece_ids).reshape(16, 1, 1)
+        
+        # 3. 極速 One-Hot 轉換核心 (消除 Python 迴圈)
+        # board_2d 的 shape 是 (4, 8)
+        # piece_ids_array 的 shape 是 (16, 1, 1)
+        # 兩者判斷相等 (==) 後，會自動擴展並回傳 shape 為 (16, 4, 8) 的布林矩陣
+        one_hot_planes = (board_2d == piece_ids_array).astype(np.float32)
+        
+        # 4. 建立全局特徵通道 (Global Features)
+        # 建立形狀為 (2, 4, 8) 的矩陣來存放回合與計數器
+        global_planes = np.zeros((2, 4, 8), dtype=np.float32)
+        
+        # 通道 16: 回合資訊 (紅方=1, 黑方=0)
+        # 如果 self.turn 為 0 代表 Player 1，你可以依照你的顏色邏輯微調
+        global_planes[0].fill(1.0 if self.turn == 0 else 0.0) 
+        
+        # 通道 17: 正規化的無吃子步數 (假設 60 步逼和)
+        global_planes[1].fill(self.no_capture_count / 60.0)
+        
+        # 5. 將 One-Hot 棋盤與全局特徵在通道維度 (axis=0) 拼接
+        # 最終 shape: (18, 4, 8)
+        state_tensor_np = np.concatenate([one_hot_planes, global_planes], axis=0)
+        
+        # 6. 轉為 PyTorch Tensor 供神經網路使用
+        return torch.from_numpy(state_tensor_np) ,self.eaten_pieces_count
+
 
     def _pos_to_coord(self, pos):
         return divmod(pos, self.cfg.BOARD_WIDTH)
@@ -269,12 +319,13 @@ class DarkChessEnv:
             else:
                 # 吃子
                 self._update_eaten_pieces_count(self.board[dst])
-                self.board[dst] = piece
-                
-                self.board[src] = self.cfg.EMPTY
-                reward = self.cfg.REWARD_EAT
+                reward = self.cfg.PIECE_VALUES[self.board[dst]]
 
-                info["Eaten_reward"] = self.cfg.REWARD_EATEN
+                self.board[dst] = piece
+                self.board[src] = self.cfg.EMPTY
+                
+
+                info["Eaten_reward"] = reward * -1
                 self.no_capture_count = 0
 
         # --- 檢查重複局面 (長捉/長將禁手判斷) ---
@@ -302,13 +353,14 @@ class DarkChessEnv:
                 self.winner = None # 和局
                 
         # --- 判定勝負 ---
-        self._check_game_over(reward, i_episode)
+        self._check_game_over(i_episode)
         reward = self._adjust_reward_for_endgame(reward)
         self.turn = 1 - self.turn
 
+        
         return self.get_state(), reward, self.game_over, info
 
-    def _check_game_over(self, current_reward, i_episode:int):
+    def _check_game_over(self, i_episode:int):
         visible_red = np.any(np.isin(self.board, self.cfg.RED_PIECES))
         visible_black = np.any(np.isin(self.board, self.cfg.BLACK_PIECES))
         hidden_count = np.sum(self.board == self.cfg.HIDDEN)
@@ -329,12 +381,103 @@ class DarkChessEnv:
             print(f"目前局數: {i_episode} , 60步沒有吃到")
             self.game_over = True
             self.winner = None # 和局
+            
+
+
+    def clone(self, determinize=True):
+        """
+        創造一個平行的虛擬環境供 MCTS 推演未來。
+        :param determinize: 是否對暗牌進行重新洗牌 (預設 True，用於 MCTS 模擬)
+        """
+        new_env = DarkChessEnv(self.cfg)
+        
+        # 1. 複製所有會影響遊戲狀態的變數 (使用 .copy() 避免記憶體共用)
+        new_env.board = self.board.copy()
+        new_env.turn = self.turn
+        new_env.my_color = self.my_color
+        new_env.game_over = self.game_over
+        new_env.winner = self.winner
+        new_env.no_capture_count = self.no_capture_count
+        new_env.state_history = self.state_history.copy()
+        new_env.eaten_pieces_count = self.eaten_pieces_count.copy()
+        # [注意] state_key 也必須複製，否則重複判斷會出錯
+        new_env.state_key = self.state_key 
+
+        if not determinize:
+            # 如果只是想單純備份環境 (不進行 MCTS 模擬)，直接複製真實底牌
+            new_env.actual_board = self.actual_board.copy()
+            return new_env
+
+        # ==========================================
+        # 核心：Determinization (確定化 / 隨機洗牌)
+        # ==========================================
+        
+        # 步驟 A：定義初始的完整棋子池 (1~14)
+        initial_counts = {
+            1: 1, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 5,  # 紅方: 帥, 仕, 相, 俥, 傌, 炮, 兵
+            8: 1, 9: 2, 10: 2, 11: 2, 12: 2, 13: 2, 14: 5 # 黑方: 將, 士, 象, 車, 馬, 包, 卒
+        }
+        
+        # 步驟 B：統計目前場上「已經翻開」的棋子
+        visible_counts = {i: 0 for i in range(1, 15)}
+        for piece in self.board:
+            if piece != self.cfg.HIDDEN and piece != self.cfg.EMPTY:
+                visible_counts[piece] += 1
+                
+        # 步驟 C：計算「還蓋在底下」的棋子種類與數量
+        hidden_pool = []
+        for piece_id in range(1, 15):
+            # 剩餘數量 = 初始總數 - 場上已亮出的數量 - 已經被吃掉的數量
+            remaining = initial_counts[piece_id] - visible_counts[piece_id] - self.eaten_pieces_count[piece_id]
+            
+            # 防呆保護：避免計數錯誤導致負數
+            remaining = max(0, remaining) 
+            hidden_pool.extend([piece_id] * remaining)
+            
+        # 確保我們算出來的暗牌數量，等於棋盤上實際蓋著的數量
+        hidden_on_board = np.sum(self.board == self.cfg.HIDDEN)
+        if len(hidden_pool) != hidden_on_board:
+            # 如果這個 print 觸發，代表你的 eaten_pieces_count 在 step 邏輯中有 bug
+            print(f"Warning: 算出的暗牌數({len(hidden_pool)})與盤面實際暗牌數({hidden_on_board})不符！")
+            # 強制截斷或補齊 (通常不會發生)
+            if len(hidden_pool) > hidden_on_board:
+                hidden_pool = hidden_pool[:hidden_on_board]
+            else:
+                hidden_pool.extend([1] * (hidden_on_board - len(hidden_pool)))
+
+        # 步驟 D：模擬平行宇宙 (洗牌)
+        random.shuffle(hidden_pool)
+        
+        # 步驟 E：重建虛擬環境的 actual_board
+        new_actual_board = np.zeros(self.cfg.NUM_PIECES, dtype=int)
+        pool_idx = 0
+        
+        for i in range(self.cfg.NUM_PIECES):
+            if self.board[i] == self.cfg.HIDDEN:
+                # 遇到蓋著的牌：從洗過的牌堆中發一張給它
+                new_actual_board[i] = hidden_pool[pool_idx]
+                pool_idx += 1
+            elif self.board[i] != self.cfg.EMPTY:
+                # 遇到已翻開的牌：底牌就是它自己
+                new_actual_board[i] = self.board[i]
+            else:
+                # 遇到空地
+                new_actual_board[i] = self.cfg.EMPTY
+                
+        new_env.actual_board = new_actual_board
+        
+        return new_env
 
     def _adjust_reward_for_endgame(self, reward):
         if self.game_over:
-            if self.winner is None:
-                reward += self.cfg.REWARD_DRAW
-            
+            if self.winner is None :
+                if self.no_capture_count >= 60:
+                    # 可能真的無法吃到 所以才拖到60步
+                    reward += self.cfg.REWARD_DRAW
+                    print("60步獎勵: ",reward)
+                else:
+                    # 無意義和棋
+                    reward += self.cfg.REWARD_LOSS_DRAW
             else:
                 # 判斷當前行動者是否獲勝
                 # 注意：step 函式末尾才切換 turn，所以這裡的 self.turn 還是當前行動者

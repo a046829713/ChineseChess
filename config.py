@@ -11,7 +11,7 @@ class GameConfig:
 
         # --- PPO 超參數 (Hyperparameters) ---
         self.LEARNING_RATE = 0.0001
-        self.GAMMA = 0.99       # 折扣因子 (降低以加速終局信號傳遞)
+        self.GAMMA = 0.95       # 折扣因子 (降低以加速終局信號傳遞)
         self.GAE_LAMBDA = 0.95
         self.EPS_CLIP = 0.2     # PPO Clip 範圍
         self.K_EPOCHS = 3      # 最多迭代次數 (配合 KL 早停)
@@ -23,16 +23,20 @@ class GameConfig:
         self.HIDDEN_DIM_2 = 128 # 第二層隱藏層
 
         # --- 獎勵機制 (Rewards) ---
-        self.REWARD_FLIP = 0.01      # 翻牌獎勵 (提高以鼓勵探索新棋子)
-        self.REWARD_MOVE = -0.05     # 普通移動
-        self.REWARD_EAT = 1        # 吃子獎勵 (提高以鼓勵進攻)
-        self.REWARD_EATEN = -1
-        self.REWARD_WIN = 30.0      # 獲勝獎勵
-        self.REWARD_LOSE = -10.0    # 落敗懲罰
-        self.REWARD_DRAW = -8.0      # 和棋 (接近落敗，逼迫 AI 積極進攻)\r\n        
+        self.REWARD_FLIP = 0.02      # 翻牌獎勵 (提高以鼓勵探索新棋子)
+        self.REWARD_WIN = 3.0       # 原本 30.0
+        self.REWARD_LOSE = -3.0     # 原本 -10.0
         
         
-    
+        
+        self.REWARD_DRAW = -0.1     # 原本 -8.0
+        self.REWARD_LOSS_DRAW = -0.5
+        self.REWARD_MOVE = -0.005   # 原本 -0.05
+        
+        self.PIECE_VALUES = {
+            1: 0.7, 2: 0.6, 3: 0.5, 4: 0.4, 5: 0.3, 6: 0.5, 7: 0.2,  # 紅方
+            8: 0.7, 9: 0.6, 10: 0.5, 11: 0.4, 12: 0.3, 13: 0.5, 14: 0.2, # 黑方
+        }
 
         
         self.REWARD_INVALID = -0.1

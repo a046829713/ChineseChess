@@ -6,6 +6,8 @@ from config import GameConfig
 import torch
 import numpy as np
 import time
+from MCTS import MCTS
+
 # 簡單的 Memory 類別，用來儲存訓練數據
 class Memory:
     def __init__(self):
@@ -47,7 +49,126 @@ class ResidualBlock(nn.Module):
         out = F.relu(out)
         return out
 
-# 2. 主模型架構
+# # 2. 主模型架構
+# class ActorCritic(nn.Module):
+#     def __init__(self, cfg=GameConfig()):
+#         super(ActorCritic, self).__init__()
+#         self.cfg = cfg
+        
+#         # --- 設定參數 ---
+#         self.history_length = 8
+#         self.board_h = 4
+#         self.board_w = 8
+#         self.embed_dim = 32     # 增加 Embedding 維度
+#         self.conv_channels = 64 # 卷積通道數
+#         self.num_res_blocks = 3 # 殘差塊數量 (越多越深，但也越慢)
+        
+#         # --- 1. 輸入層 ---
+#         # 棋子 Embedding: 0-14 + 15(Hidden) -> 64維
+#         self.embedding = nn.Embedding(16, self.embed_dim)
+        
+
+#         self.in_channels = self.history_length * self.embed_dim
+#         # 初始卷積層 (將 Embedding 轉為特徵圖)
+#         self.conv_input = nn.Sequential(
+#             nn.Conv2d(self.in_channels, self.conv_channels, kernel_size=3, padding=1),
+#             nn.BatchNorm2d(self.conv_channels),
+#             nn.ReLU()
+#         )
+        
+#         # --- 2. 骨幹網路 (Backbone) ---
+#         # 堆疊殘差塊
+#         self.res_blocks = nn.Sequential(
+#             *[ResidualBlock(self.conv_channels) for _ in range(self.num_res_blocks)]
+#         )
+        
+#         # --- 3. 處理 Turn (回合/顏色) ---
+#         self.turn_embedding = nn.Embedding(2, 16)
+        
+#         # --- 4. 全連接層準備 ---
+#         # CNN 輸出扁平化後的維度: 64通道 * 4高 * 8寬 = 2048
+#         self.flatten_dim = self.conv_channels * self.board_h * self.board_w
+        
+        
+#         # 加上 Turn 的 embedding 維度
+#         # turn 16 , no_capture_count 1 eaten_pieces_count 16
+#         self.fc_input_dim = self.flatten_dim + 16 + 1 + 16
+        
+#         self.fc_shared = nn.Linear(self.fc_input_dim, 512)
+        
+#         # --- 5. 輸出頭 (Heads) ---
+#         # Action Head (Actor)
+#         self.action_head = nn.Sequential(
+#             nn.Linear(512, 256),
+#             nn.ReLU(),
+#             nn.Linear(256, self.cfg.TOTAL_ACTIONS)
+#         )
+        
+#         # Value Head (Critic)
+#         self.value_head = nn.Sequential(
+#             nn.Linear(512, 128),
+#             nn.ReLU(),
+#             nn.Linear(128, 1)
+#         )
+
+#     def forward(self, state, turn, eaten_state):
+#         # state shape: (Batch, 32) -> Flattened integers
+        
+#         # 1. 預處理 State
+#         state = state.clone().detach().long()
+#         state[state == -1] = 15 # 處理 Hidden
+        
+#         # Reshape 回 2D 棋盤: (Batch, 4, 8)
+#         # 注意: 你的 Config 必須確保 NUM_PIECES = 32 = 4*8
+#         batch_size = state.size(0)
+        
+
+#         state_2d = state.view(batch_size, self.history_length, self.board_h, self.board_w)
+
+
+#         x = self.embedding(state_2d)
+#         # 3. 巧妙的張量重組 (AlphaZero 核心邏輯)
+#         # 目的：將 History 與 Embed_Dim 合併為 CNN 的 Channel
+        
+        
+#         # 原本: (Batch, History, H, W, Embed)
+#         # 第一步 Permute: 變成 (Batch, History, Embed, H, W)
+#         x = x.permute(0, 1, 4, 2, 3) 
+        
+#         # 第二步 Reshape: 變成 (Batch, History * Embed, H, W) -> 即 (Batch, 256, 4, 8)
+#         x = x.reshape(batch_size, self.in_channels, self.board_h, self.board_w)
+        
+#         # 3. CNN Backbone
+#         x = self.conv_input(x)
+#         x = self.res_blocks(x)
+        
+        
+#         # 4. Flatten
+#         x = x.flatten(start_dim=1)
+  
+#         # 5. 加入 Turn 資訊
+#         if isinstance(turn, int):
+#             turn = torch.tensor([turn], device=state.device)
+
+#         if turn.dim() == 1:
+#              if turn.size(0) != batch_size:
+#                  turn = turn.expand(batch_size)
+        
+
+#         # # 拼接 (Board Features + Turn Features)
+#         x = torch.cat([x, self.turn_embedding(turn)], dim=1)
+#         x = torch.cat([x, eaten_state], dim=1)
+        
+#         # 6. Shared FC
+#         x = F.relu(self.fc_shared(x))
+        
+#         # 7. Outputs
+#         action_logits = self.action_head(x)
+#         state_values = self.value_head(x)
+        
+#         return action_logits, state_values
+
+
 class ActorCritic(nn.Module):
     def __init__(self, cfg=GameConfig()):
         super(ActorCritic, self).__init__()
@@ -56,103 +177,73 @@ class ActorCritic(nn.Module):
         # --- 設定參數 ---
         self.board_h = 4
         self.board_w = 8
-        self.embed_dim = 64     # 增加 Embedding 維度
         self.conv_channels = 64 # 卷積通道數
-        self.num_res_blocks = 3 # 殘差塊數量 (越多越深，但也越慢)
+        self.num_res_blocks = 3 # 殘差塊數量
         
         # --- 1. 輸入層 ---
-        # 棋子 Embedding: 0-14 + 15(Hidden) -> 64維
-        self.embedding = nn.Embedding(16, self.embed_dim)
-        
-        # 初始卷積層 (將 Embedding 轉為特徵圖)
+        # 輸入已經是 (18, 4, 8) 的空間特徵，直接對接 CNN
+        self.in_channels = 18 
         self.conv_input = nn.Sequential(
-            nn.Conv2d(self.embed_dim, self.conv_channels, kernel_size=3, padding=1),
+            nn.Conv2d(self.in_channels, self.conv_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(self.conv_channels),
             nn.ReLU()
         )
         
         # --- 2. 骨幹網路 (Backbone) ---
-        # 堆疊殘差塊
         self.res_blocks = nn.Sequential(
             *[ResidualBlock(self.conv_channels) for _ in range(self.num_res_blocks)]
         )
         
-        # --- 3. 處理 Turn (回合/顏色) ---
-        self.turn_embedding = nn.Embedding(2, 16)
-        
-        # --- 4. 全連接層準備 ---
-        # CNN 輸出扁平化後的維度: 64通道 * 4高 * 8寬 = 2048
+        # --- 3. 全連接層準備 ---
         self.flatten_dim = self.conv_channels * self.board_h * self.board_w
         
-        
-        # 加上 Turn 的 embedding 維度
-        # turn 16 , no_capture_count 1 eaten_pieces_count 16
-        self.fc_input_dim = self.flatten_dim + 16 + 1 + 16
+        # eaten_state 是 15 維的陣列 (紀錄 1-14號棋子與 0號空地的被吃數量)
+        self.fc_input_dim = self.flatten_dim + 15
         
         self.fc_shared = nn.Linear(self.fc_input_dim, 512)
         
-        # --- 5. 輸出頭 (Heads) ---
-        # Action Head (Actor)
+        # --- 4. 輸出頭 (Heads) ---
         self.action_head = nn.Sequential(
             nn.Linear(512, 256),
             nn.ReLU(),
             nn.Linear(256, self.cfg.TOTAL_ACTIONS)
         )
         
-        # Value Head (Critic)
         self.value_head = nn.Sequential(
             nn.Linear(512, 128),
             nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(128, 1),
+            nn.Tanh() # [新增] AlphaZero 規範，讓勝率收斂在 -1 (必輸) 到 1 (必勝)
         )
 
-    def forward(self, state, turn, eaten_state):
-        # state shape: (Batch, 32) -> Flattened integers
+    # [修改] 移除了 turn 參數，因為它已經在 state 裡面了
+    def forward(self, state, eaten_state):
         
-        # 1. 預處理 State
-        state = state.clone().detach().long()
-        state[state == -1] = 15 # 處理 Hidden
+        # 1. 輸入直接就是 (Batch, 18, 4, 8) 的 FloatTensor，不需要任何 Reshape！
+        x = state
         
-        # Reshape 回 2D 棋盤: (Batch, 4, 8)
-        # 注意: 你的 Config 必須確保 NUM_PIECES = 32 = 4*8
-        batch_size = state.size(0)
-        state_2d = state.view(batch_size, self.board_h, self.board_w) 
-
-        # 2. Embedding + Transpose
-        # Embed 輸出: (Batch, 4, 8, Embed_Dim)
-        x = self.embedding(state_2d)
-        # Permute 為 Conv2d 需要的格式: (Batch, Channels, Height, Width)
-        x = x.permute(0, 3, 1, 2) 
-        
-        # 3. CNN Backbone
+        # 2. CNN Backbone
         x = self.conv_input(x)
         x = self.res_blocks(x)
         
-        
-        # 4. Flatten
+        # 3. Flatten
         x = x.flatten(start_dim=1)
-  
-        # 5. 加入 Turn 資訊
-        if isinstance(turn, int):
-            turn = torch.tensor([turn], device=state.device)
-
-        if turn.dim() == 1:
-             if turn.size(0) != batch_size:
-                 turn = turn.expand(batch_size)
         
-
-        # # 拼接 (Board Features + Turn Features)
-        x = torch.cat([x, self.turn_embedding(turn)], dim=1)
+        # 4. 拼接 eaten_state (全局特徵)
         x = torch.cat([x, eaten_state], dim=1)
-        
-        # 6. Shared FC
+
+        # 5. Shared FC
         x = F.relu(self.fc_shared(x))
         
-        # 7. Outputs
+        # 6. Outputs
         action_logits = self.action_head(x)
         state_values = self.value_head(x)
         
         return action_logits, state_values
+
+
+
+
 
 class PPOAgent:
     def __init__(self, cfg):
@@ -165,49 +256,90 @@ class PPOAgent:
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.MseLoss = nn.MSELoss()
 
-    def select_action(self, state, turn, mask, eaten_state):
-        state_t = torch.LongTensor(state).unsqueeze(0).to(self.device)
-        turn_t = torch.LongTensor([turn]).to(self.device)
-        mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.device)
-        # [修正 Bug 3] 使用 FloatTensor (與 Memory 中的 FloatTensor 一致)
+    def select_action(self, env, state, eaten_state, temperature=1.0):
+        """
+        結合 MCTS 的動作選擇機制
+        :param env: 當前的真實遊戲環境 (將用於 MCTS clone 推演)
+        :param temperature: 溫度參數 (1.0 代表依賴 MCTS 機率探索，0.0 代表直接選最高分)
+        """
+
+        # 1. 準備 Tensor 供神經網路使用
+        state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         eaten_state_t = torch.FloatTensor(eaten_state).unsqueeze(0).to(self.device)
 
+        # 2. 實例化 MCTS (每次走步都重新建構一棵樹)
+        # 注意：使用 policy_old 進行推演，保持與 PPO 收集資料時的權重一致
+        mcts = MCTS(policy_net=self.policy_old, cfg=self.cfg, device=self.device,  num_simulations=50, c_puct=1.5)
+
+        # 3. 呼叫 MCTS 進行推演，取得平滑且避開禁手的動作機率
+        mcts_probs = mcts.search(initial_env=env, state_tensor=state_t, eaten_state_tensor=eaten_state_t)
+
+        # 4. 根據溫度參數決定實際要走哪一步 (Action Sampling)
+        if temperature <= 1e-3:
+            # 評估模式或遊戲後期：直接選 MCTS 算出來訪問最多次的那步
+            action = int(np.argmax(mcts_probs))
+        else:
+            # 訓練模式：加上微小的 epsilon 避免機率全為 0 的數值問題
+            mcts_probs = mcts_probs + 1e-10
+            mcts_probs = mcts_probs / np.sum(mcts_probs)
+            # 根據 MCTS 輸出的機率分佈進行隨機抽樣
+            action = np.random.choice(len(mcts_probs), p=mcts_probs)
+
+        # 5. [核心關鍵] 取得神經網路的 log_prob 供 PPO 更新使用
         with torch.no_grad():
-            logits, _ = self.policy_old(state_t, turn_t, eaten_state_t)
+            logits, _ = self.policy_old(state_t, eaten_state_t)
+            mask = env.get_legal_actions(env.turn)
+            mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.device)
+            
+            # Mask 掉非法動作
             logits[~mask_t] = -float('inf')
             dist = Categorical(logits=logits)
-            action = dist.sample()
+            
+            # 取得「純神經網路」對於這個被選中動作的 log_prob
+            action_tensor = torch.tensor([action]).to(self.device)
+            log_prob = dist.log_prob(action_tensor).item()
 
-        return action.item(), dist.log_prob(action).item()
+        # 額外回傳 mcts_probs（可選），未來如果你想從 PPO 完全轉向 AlphaZero Loss 會用到
+        return action, log_prob, mcts_probs
 
 
-    def evaluate_action(self, state, turn, mask, eaten_state):
+    # def evaluate_action(self, state, mask, eaten_state):
+    #     """
+    #         評估模式：不進行隨機抽樣，直接選擇機率最大的合法動作。
+    #     """
+    #     state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        
+    #     mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.device)
+    #     # [修正 Bug 3] 使用 FloatTensor (與 Memory 中的 FloatTensor 一致)
+    #     eaten_state_t = torch.FloatTensor(eaten_state).unsqueeze(0).to(self.device)
+
+    #     # 切換到評估模式 (影響 BatchNorm/Dropout 等)
+    #     self.policy.eval()
+
+    #     with torch.no_grad():
+    #         # 評估時直接用最新的 policy 網路
+    #         logits, _ = self.policy(state_t, eaten_state_t)
+            
+    #         # 一樣要 Mask 掉不合法的動作
+    #         logits[~mask_t] = -float('inf')
+            
+    #         # 使用 argmax 取得最大值的索引 (這就是機率最高的動作)
+    #         action = torch.argmax(logits, dim=1)
+
+    #     # 恢復為訓練模式
+    #     self.policy.train()
+    #     return action.item()
+    def evaluate_action(self, env, state, eaten_state):
         """
-            評估模式：不進行隨機抽樣，直接選擇機率最大的合法動作。
+        評估模式：完全依賴 MCTS 取最佳解 (不進行隨機抽樣)
         """
-        state_t = torch.LongTensor(state).unsqueeze(0).to(self.device)
-        turn_t = torch.LongTensor([turn]).to(self.device)
-        mask_t = torch.BoolTensor(mask).unsqueeze(0).to(self.device)
-        # [修正 Bug 3] 使用 FloatTensor (與 Memory 中的 FloatTensor 一致)
-        eaten_state_t = torch.FloatTensor(eaten_state).unsqueeze(0).to(self.device)
-
-        # 切換到評估模式 (影響 BatchNorm/Dropout 等)
         self.policy.eval()
-
-        with torch.no_grad():
-            # 評估時直接用最新的 policy 網路
-            logits, _ = self.policy(state_t, turn_t, eaten_state_t)
-            
-            # 一樣要 Mask 掉不合法的動作
-            logits[~mask_t] = -float('inf')
-            
-            # 使用 argmax 取得最大值的索引 (這就是機率最高的動作)
-            action = torch.argmax(logits, dim=1)
-
-        # 恢復為訓練模式
+        
+        # 溫度設為 0，直接取 argmax
+        action, _, _ = self.select_action(env, state, eaten_state, temperature=0.0)
+        
         self.policy.train()
-        return action.item()
-
+        return action
 
     def update(self, memory):
         """
@@ -221,13 +353,12 @@ class PPOAgent:
         # --- 1. 準備舊資料並計算舊的價值 (No Grad) ---
         with torch.no_grad():
             old_states = torch.stack(memory.states).to(self.device)
-            old_turns = torch.tensor(memory.turns, dtype=torch.long).to(self.device)
             old_eaten_states = torch.stack(memory.eaten_states).to(self.device)
             old_actions = torch.stack(memory.actions).to(self.device)
             old_logprobs = torch.stack(memory.logprobs).to(self.device)
             old_masks = torch.stack(memory.masks).to(self.device)
             
-            _, old_state_values = self.policy(old_states, old_turns, old_eaten_states)
+            _, old_state_values = self.policy(old_states, old_eaten_states)
             # 壓平並傳到 CPU 以利順序迴圈計算
             old_state_values = old_state_values.squeeze(-1)
             old_values_cpu = old_state_values.cpu()
@@ -265,7 +396,7 @@ class PPOAgent:
 
         for _ in range(self.cfg.K_EPOCHS):
             # Forward pass (計算新的 logits 和 values)
-            logits, state_values = self.policy(old_states, old_turns, old_eaten_states)
+            logits, state_values = self.policy(old_states, old_eaten_states)
             logits[~old_masks] = -float('inf')  # Apply Mask
             state_values = state_values.squeeze(-1)
             
